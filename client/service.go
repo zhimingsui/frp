@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"time"
@@ -40,6 +41,12 @@ import (
 
 func init() {
 	crypto.DefaultSalt = "frp"
+	// Disable quic-go's receive buffer warning.
+	os.Setenv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING", "true")
+	// Disable quic-go's ECN support by default. It may cause issues on certain operating systems.
+	if os.Getenv("QUIC_GO_DISABLE_ECN") == "" {
+		os.Setenv("QUIC_GO_DISABLE_ECN", "true")
+	}
 }
 
 type cancelErr struct {
@@ -162,6 +169,15 @@ func (svr *Service) Run(ctx context.Context) error {
 		netpkg.SetDefaultDNSAddress(svr.common.DNSServer)
 	}
 
+	if svr.webServer != nil {
+		go func() {
+			log.Infof("admin server listen on %s", svr.webServer.Address())
+			if err := svr.webServer.Run(); err != nil {
+				log.Warnf("admin server exit with error: %v", err)
+			}
+		}()
+	}
+
 	// first login to frps
 	svr.loopLoginUntilSuccess(10*time.Second, lo.FromPtr(svr.common.LoginFailExit))
 	if svr.ctl == nil {
@@ -172,14 +188,6 @@ func (svr *Service) Run(ctx context.Context) error {
 
 	go svr.keepControllerWorking()
 
-	if svr.webServer != nil {
-		go func() {
-			log.Info("admin server listen on %s", svr.webServer.Address())
-			if err := svr.webServer.Run(); err != nil {
-				log.Warn("admin server exit with error: %v", err)
-			}
-		}()
-	}
 	<-svr.ctx.Done()
 	svr.stop()
 	return nil
@@ -192,16 +200,16 @@ func (svr *Service) keepControllerWorking() {
 	// the control immediately exits. It is necessary to limit the frequency of reconnection in this case.
 	// The interval for the first three retries in 1 minute will be very short, and then it will increase exponentially.
 	// The maximum interval is 20 seconds.
-	wait.BackoffUntil(func() error {
+	wait.BackoffUntil(func() (bool, error) {
 		// loopLoginUntilSuccess is another layer of loop that will continuously attempt to
 		// login to the server until successful.
 		svr.loopLoginUntilSuccess(20*time.Second, false)
 		if svr.ctl != nil {
 			<-svr.ctl.Done()
-			return errors.New("control is closed and try another loop")
+			return false, errors.New("control is closed and try another loop")
 		}
 		// If the control is nil, it means that the login failed and the service is also closed.
-		return nil
+		return false, nil
 	}, wait.NewFastBackoffManager(
 		wait.FastBackoffOptions{
 			Duration:        time.Second,
@@ -269,30 +277,29 @@ func (svr *Service) login() (conn net.Conn, connector Connector, err error) {
 
 	if loginRespMsg.Error != "" {
 		err = fmt.Errorf("%s", loginRespMsg.Error)
-		xl.Error("%s", loginRespMsg.Error)
+		xl.Errorf("%s", loginRespMsg.Error)
 		return
 	}
 
 	svr.runID = loginRespMsg.RunID
 	xl.AddPrefix(xlog.LogPrefix{Name: "runID", Value: svr.runID})
 
-	xl.Info("login to server success, get run id [%s]", loginRespMsg.RunID)
+	xl.Infof("login to server success, get run id [%s]", loginRespMsg.RunID)
 	return
 }
 
 func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginExit bool) {
 	xl := xlog.FromContextSafe(svr.ctx)
-	successCh := make(chan struct{})
 
-	loginFunc := func() error {
-		xl.Info("try to connect to server...")
+	loginFunc := func() (bool, error) {
+		xl.Infof("try to connect to server...")
 		conn, connector, err := svr.login()
 		if err != nil {
-			xl.Warn("connect to server error: %v", err)
+			xl.Warnf("connect to server error: %v", err)
 			if firstLoginExit {
 				svr.cancel(cancelErr{Err: err})
 			}
-			return err
+			return false, err
 		}
 
 		svr.cfgMu.RLock()
@@ -314,8 +321,8 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 		ctl, err := NewControl(svr.ctx, sessionCtx)
 		if err != nil {
 			conn.Close()
-			xl.Error("NewControl error: %v", err)
-			return err
+			xl.Errorf("NewControl error: %v", err)
+			return false, err
 		}
 		ctl.SetInWorkConnCallback(svr.handleWorkConnCb)
 
@@ -327,9 +334,7 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 		}
 		svr.ctl = ctl
 		svr.ctlMu.Unlock()
-
-		close(successCh)
-		return nil
+		return true, nil
 	}
 
 	// try to reconnect to server until success
@@ -339,9 +344,7 @@ func (svr *Service) loopLoginUntilSuccess(maxInterval time.Duration, firstLoginE
 			Factor:      2,
 			Jitter:      0.1,
 			MaxDuration: maxInterval,
-		}),
-		true,
-		wait.MergeAndCloseOnAnyStopChannel(svr.ctx.Done(), successCh))
+		}), true, svr.ctx.Done())
 }
 
 func (svr *Service) UpdateAllConfigurer(proxyCfgs []v1.ProxyConfigurer, visitorCfgs []v1.VisitorConfigurer) error {
@@ -378,18 +381,31 @@ func (svr *Service) stop() {
 	}
 }
 
-// TODO(fatedier): Use StatusExporter to provide query interfaces instead of directly using methods from the Service.
-func (svr *Service) GetProxyStatus(name string) (*proxy.WorkingStatus, error) {
+func (svr *Service) getProxyStatus(name string) (*proxy.WorkingStatus, bool) {
 	svr.ctlMu.RLock()
 	ctl := svr.ctl
 	svr.ctlMu.RUnlock()
 
 	if ctl == nil {
-		return nil, fmt.Errorf("control is not running")
+		return nil, false
 	}
-	ws, ok := ctl.pm.GetProxyStatus(name)
-	if !ok {
-		return nil, fmt.Errorf("proxy [%s] is not found", name)
+	return ctl.pm.GetProxyStatus(name)
+}
+
+func (svr *Service) StatusExporter() StatusExporter {
+	return &statusExporterImpl{
+		getProxyStatusFunc: svr.getProxyStatus,
 	}
-	return ws, nil
+}
+
+type StatusExporter interface {
+	GetProxyStatus(name string) (*proxy.WorkingStatus, bool)
+}
+
+type statusExporterImpl struct {
+	getProxyStatusFunc func(name string) (*proxy.WorkingStatus, bool)
+}
+
+func (s *statusExporterImpl) GetProxyStatus(name string) (*proxy.WorkingStatus, bool) {
+	return s.getProxyStatusFunc(name)
 }
